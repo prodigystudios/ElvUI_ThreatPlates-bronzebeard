@@ -8,14 +8,12 @@ local NP = E:GetModule('NamePlates')
 local EP = LibStub('LibElvUIPlugin-1.0')
 local addonName = ...
 
-local pairs, tostring, type = pairs, tostring, type
 local strlower = string.lower
 local tinsert = table.insert
 
 local UnitExists = _G.UnitExists
 local UnitName = _G.UnitName
 local UnitThreatSituation = _G.UnitThreatSituation
-local UnitGUID = _G.UnitGUID
 local UnitClass = _G.UnitClass
 local GetTime = _G.GetTime
 local CreateFrame = _G.CreateFrame
@@ -31,6 +29,7 @@ local DEFAULTS = {
     enabled = true,
     autoMainTanks = true,
     onlyInGroup = false,
+    preferPlayerPrimary = true,
     debug = false,
     borderSize = 3,
     borderAlpha = 0.95,
@@ -128,12 +127,47 @@ function MOD:GetCustomColorForSlot(slot)
     return { r = color.r or fallback.r, g = color.g or fallback.g, b = color.b or fallback.b }
 end
 
+function MOD:GetAssignedTankNameForSlot(slot)
+    if not (self.db and self.db.customColorAssignments) then
+        return nil
+    end
+
+    local tanksByKey = {}
+    self:ForEachConfiguredTankUnit(function(tankUnit, tankName)
+        local key = GetUnitKey(tankName)
+        if key then
+            tanksByKey[key] = tankName or tankUnit
+        end
+    end)
+
+    for key, assignedSlot in pairs(self.db.customColorAssignments) do
+        if assignedSlot == slot then
+            return tanksByKey[key] or key
+        end
+    end
+
+    return nil
+end
+
 function MOD:RefreshCustomColorAssignments(tanks)
     if not self.db then return end
 
     local previousAssignments = self.db.customColorAssignments or {}
     local nextAssignments = {}
     local usedSlots = {}
+    local playerName = UnitExists('player') and UnitName('player') or nil
+    local playerKey = GetUnitKey(playerName)
+
+    if self.db.preferPlayerPrimary and playerKey then
+        for i = 1, #tanks do
+            local tank = tanks[i]
+            if tank.key == playerKey then
+                nextAssignments[playerKey] = 1
+                usedSlots[1] = true
+                break
+            end
+        end
+    end
 
     for i = 1, #tanks do
         local tank = tanks[i]
@@ -191,7 +225,7 @@ function MOD:GetPreviewColor()
     end
 
     if UnitExists('player') then
-        return self:GetConfiguredTankColor('player')
+        return self:GetConfiguredTankColor('player', UnitName('player'))
     end
 
     return { r = 1, g = 0.82, b = 0.2 }
@@ -762,14 +796,14 @@ function MOD:InsertOptions()
                         type = 'toggle',
                         name = 'Enable',
                         desc = 'Turn the threat border and overlay system on or off.',
-                        width = 'full',
+                        width = 'half',
                     },
                     autoMainTanks = {
 						order = 3,
 						type = 'toggle',
-						name = 'Auto Raid Main Tanks',
+                        name = 'Auto MTs',
 						desc = 'Use current raid Main Tank assignments as the threat color source.',
-						width = 'full',
+                        width = 'full',
 						set = function(info, value)
 							self.db[info[#info]] = value
 							self:ClearAllCachedColors()
@@ -779,8 +813,20 @@ function MOD:InsertOptions()
                     onlyInGroup = {
                         order = 4,
                         type = 'toggle',
-                        name = 'Only In Group/Raid',
+                        name = 'Only Group/Raid',
                         desc = 'Only show threat markers while you are in a party or raid.',
+                        width = 'full',
+                        set = function(info, value)
+                            self.db[info[#info]] = value
+                            self:ClearAllCachedColors()
+                            self:ForceUpdatePlates()
+                        end,
+                    },
+                    preferPlayerPrimary = {
+                        order = 5,
+                        type = 'toggle',
+                        name = 'Player = MT1',
+                        desc = 'If you are one of the detected Main Tanks, always assign yourself to Tank 1.',
                         width = 'full',
                         set = function(info, value)
                             self.db[info[#info]] = value
@@ -816,7 +862,7 @@ function MOD:InsertOptions()
                         end,
                     },
                     borderSize = {
-                        order = 3,
+                        order = 7,
                         type = 'range',
                         name = 'Border Size',
                         desc = 'Controls the thickness of the outer threat border.',
@@ -830,7 +876,7 @@ function MOD:InsertOptions()
                         end,
                     },
                     borderAlpha = {
-                        order = 4,
+                        order = 8,
                         type = 'range',
                         name = 'Border Opacity',
                         desc = 'Controls how visible the outer threat border is.',
@@ -845,7 +891,7 @@ function MOD:InsertOptions()
                         end,
                     },
                     overlayAlpha = {
-                        order = 5,
+                        order = 9,
                         type = 'range',
                         name = 'Overlay Opacity',
                         desc = 'Controls how strong the health bar overlay appears.',
@@ -861,7 +907,7 @@ function MOD:InsertOptions()
                         end,
                     },
                     useCustomColor = {
-                        order = 6,
+                        order = 10,
                         type = 'toggle',
                         name = 'Use Custom Colors',
                         desc = 'Use one custom color for tank 1 and another for tank 2 instead of class colors.',
@@ -873,59 +919,15 @@ function MOD:InsertOptions()
                         end,
                     },
                     customColorInfo = {
-                        order = 7,
+                        order = 11,
                         type = 'description',
-                        name = 'Custom colors are assigned to the first and second detected Main Tanks.',
+                        name = 'Custom colors are assigned to the first and second detected Main Tanks. If Player Always MT1 is enabled, your character stays on Tank 1 whenever you are one of them.',
                         fontSize = 'medium',
                         width = 'full',
                         hidden = function() return not self.db.useCustomColor end,
                     },
-                    customColorOne = {
-                        order = 8,
-                        type = 'color',
-                        name = 'Tank 1 Color',
-                        desc = 'Custom color used for the first detected Main Tank.',
-                        width = 'half',
-                        disabled = function() return not self.db.useCustomColor end,
-                        get = function()
-                            local colors = self.db.customColors or DEFAULTS.customColors
-                            local color = colors[1] or DEFAULTS.customColors[1]
-                            return color.r, color.g, color.b
-                        end,
-                        set = function(_, r, g, b)
-                            self.db.customColors = self.db.customColors or {}
-                            self.db.customColors[1] = self.db.customColors[1] or {}
-                            self.db.customColors[1].r = r
-                            self.db.customColors[1].g = g
-                            self.db.customColors[1].b = b
-                            self:ClearAllCachedColors()
-                            self:ForceUpdatePlates()
-                        end,
-                    },
-                    customColorTwo = {
-                        order = 9,
-                        type = 'color',
-                        name = 'Tank 2 Color',
-                        desc = 'Custom color used for the second detected Main Tank.',
-                        width = 'half',
-                        disabled = function() return not self.db.useCustomColor end,
-                        get = function()
-                            local colors = self.db.customColors or DEFAULTS.customColors
-                            local color = colors[2] or DEFAULTS.customColors[2]
-                            return color.r, color.g, color.b
-                        end,
-                        set = function(_, r, g, b)
-                            self.db.customColors = self.db.customColors or {}
-                            self.db.customColors[2] = self.db.customColors[2] or {}
-                            self.db.customColors[2].r = r
-                            self.db.customColors[2].g = g
-                            self.db.customColors[2].b = b
-                            self:ClearAllCachedColors()
-                            self:ForceUpdatePlates()
-                        end,
-                    },
                     presetSubtle = {
-                        order = 10,
+                        order = 3,
                         type = 'execute',
                         name = 'Subtle',
                         width = 0.7,
@@ -934,7 +936,7 @@ function MOD:InsertOptions()
                         end,
                     },
                     presetStrong = {
-                        order = 11,
+                        order = 4,
                         type = 'execute',
                         name = 'Strong',
                         width = 0.7,
@@ -943,7 +945,7 @@ function MOD:InsertOptions()
                         end,
                     },
                     presetBorderOnly = {
-                        order = 12,
+                        order = 5,
                         type = 'execute',
                         name = 'Border Only',
                         width = 0.9,
@@ -952,13 +954,87 @@ function MOD:InsertOptions()
                         end,
                     },
                     presetOverlayOnly = {
-                        order = 13,
+                        order = 6,
                         type = 'execute',
                         name = 'Overlay Only',
                         width = 0.9,
                         func = function()
                             self:ApplyPreset('overlay')
                         end,
+                    },
+                    presetSpacer = {
+                        order = 6.5,
+                        type = 'description',
+                        name = ' ',
+                        width = 'full',
+                    },
+                    tankOneGroup = {
+                        order = 12,
+                        type = 'group',
+                        guiInline = true,
+                        name = function()
+                            local tankName = self:GetAssignedTankNameForSlot(1) or 'Unassigned'
+                            return ('Tank 1: %s'):format(tankName)
+                        end,
+                        width = 'half',
+                        hidden = function() return not self.db.useCustomColor end,
+                        args = {
+                            color = {
+                                order = 1,
+                                type = 'color',
+                                name = ' ',
+                                desc = 'Custom color used for the first detected Main Tank.',
+                                width = 'full',
+                                get = function()
+                                    local colors = self.db.customColors or DEFAULTS.customColors
+                                    local color = colors[1] or DEFAULTS.customColors[1]
+                                    return color.r, color.g, color.b
+                                end,
+                                set = function(_, r, g, b)
+                                    self.db.customColors = self.db.customColors or {}
+                                    self.db.customColors[1] = self.db.customColors[1] or {}
+                                    self.db.customColors[1].r = r
+                                    self.db.customColors[1].g = g
+                                    self.db.customColors[1].b = b
+                                    self:ClearAllCachedColors()
+                                    self:ForceUpdatePlates()
+                                end,
+                            },
+                        },
+                    },
+                    tankTwoGroup = {
+                        order = 13,
+                        type = 'group',
+                        guiInline = true,
+                        name = function()
+                            local tankName = self:GetAssignedTankNameForSlot(2) or 'Unassigned'
+                            return ('Tank 2: %s'):format(tankName)
+                        end,
+                        width = 'half',
+                        hidden = function() return not self.db.useCustomColor end,
+                        args = {
+                            color = {
+                                order = 1,
+                                type = 'color',
+                                name = ' ',
+                                desc = 'Custom color used for the second detected Main Tank.',
+                                width = 'full',
+                                get = function()
+                                    local colors = self.db.customColors or DEFAULTS.customColors
+                                    local color = colors[2] or DEFAULTS.customColors[2]
+                                    return color.r, color.g, color.b
+                                end,
+                                set = function(_, r, g, b)
+                                    self.db.customColors = self.db.customColors or {}
+                                    self.db.customColors[2] = self.db.customColors[2] or {}
+                                    self.db.customColors[2].r = r
+                                    self.db.customColors[2].g = g
+                                    self.db.customColors[2].b = b
+                                    self:ClearAllCachedColors()
+                                    self:ForceUpdatePlates()
+                                end,
+                            },
+                        },
                     },
                 },
             },
