@@ -20,6 +20,8 @@ local UnitClass = _G.UnitClass
 local GetTime = _G.GetTime
 local CreateFrame = _G.CreateFrame
 local GetPartyAssignment = _G.GetPartyAssignment
+local GetNumPartyMembers = _G.GetNumPartyMembers
+local GetNumRaidMembers = _G.GetNumRaidMembers
 local RAID_CLASS_COLORS = _G.RAID_CLASS_COLORS
 local CUSTOM_CLASS_COLORS = _G.CUSTOM_CLASS_COLORS
 
@@ -28,11 +30,26 @@ local ADDON_DB = 'ElvUIThreatPlatesDB'
 local DEFAULTS = {
     enabled = true,
     autoMainTanks = true,
+    onlyInGroup = false,
     debug = false,
     borderSize = 3,
     borderAlpha = 0.95,
     overlayEnabled = true,
     overlayAlpha = 0.18,
+    useCustomColor = false,
+    customColors = {
+        {
+            r = 0.2,
+            g = 0.6,
+            b = 1,
+        },
+        {
+            r = 1,
+            g = 0.45,
+            b = 0.15,
+        },
+    },
+    customColorAssignments = {},
 }
 
 local COLOR_CACHE_TTL = 1
@@ -83,7 +100,16 @@ local MOD = E:NewModule('ElvUIThreatPlates', 'AceHook-3.0', 'AceEvent-3.0')
 
 function MOD:InitDB()
     _G[ADDON_DB] = _G[ADDON_DB] or {}
+    local legacyCustomColor = _G[ADDON_DB].customColor
     CopyDefaults(DEFAULTS, _G[ADDON_DB])
+    if legacyCustomColor then
+        _G[ADDON_DB].customColors = _G[ADDON_DB].customColors or {}
+        _G[ADDON_DB].customColors[1] = _G[ADDON_DB].customColors[1] or {}
+        _G[ADDON_DB].customColors[1].r = legacyCustomColor.r or DEFAULTS.customColors[1].r
+        _G[ADDON_DB].customColors[1].g = legacyCustomColor.g or DEFAULTS.customColors[1].g
+        _G[ADDON_DB].customColors[1].b = legacyCustomColor.b or DEFAULTS.customColors[1].b
+        _G[ADDON_DB].customColor = nil
+    end
     _G[ADDON_DB].tanks = nil
     self.db = _G[ADDON_DB]
 	self.CustomColorCache = self.CustomColorCache or {}
@@ -92,6 +118,138 @@ end
 function MOD:DebugPrint(message)
 	if not (self.db and self.db.debug) then return end
 	E:Print(('ElvUIThreatPlates Debug: %s'):format(tostring(message)))
+end
+
+function MOD:GetCustomColorForSlot(slot)
+    local colors = self.db and self.db.customColors
+    local color = colors and colors[slot]
+    local fallback = DEFAULTS.customColors[slot] or DEFAULTS.customColors[1]
+    color = color or fallback
+    return { r = color.r or fallback.r, g = color.g or fallback.g, b = color.b or fallback.b }
+end
+
+function MOD:RefreshCustomColorAssignments(tanks)
+    if not self.db then return end
+
+    local previousAssignments = self.db.customColorAssignments or {}
+    local nextAssignments = {}
+    local usedSlots = {}
+
+    for i = 1, #tanks do
+        local tank = tanks[i]
+        local slot = tank.key and previousAssignments[tank.key]
+        if slot and slot >= 1 and slot <= 2 and not usedSlots[slot] then
+            nextAssignments[tank.key] = slot
+            usedSlots[slot] = true
+        end
+    end
+
+    for i = 1, #tanks do
+        local tank = tanks[i]
+        if tank.key and not nextAssignments[tank.key] then
+            for slot = 1, 2 do
+                if not usedSlots[slot] then
+                    nextAssignments[tank.key] = slot
+                    usedSlots[slot] = true
+                    break
+                end
+            end
+        end
+    end
+
+    self.db.customColorAssignments = nextAssignments
+end
+
+function MOD:GetConfiguredTankColor(unit, unitName)
+    if self.db and self.db.useCustomColor then
+        local key = GetUnitKey(unitName)
+        local slot = key and self.db.customColorAssignments and self.db.customColorAssignments[key]
+        if slot then
+            return self:GetCustomColorForSlot(slot)
+        end
+
+        return self:GetCustomColorForSlot(1)
+    end
+
+    return GetClassColor(unit)
+end
+
+function MOD:IsGroupContextActive()
+    local raidMembers = GetNumRaidMembers and GetNumRaidMembers() or 0
+    local partyMembers = GetNumPartyMembers and GetNumPartyMembers() or 0
+    return raidMembers > 0 or partyMembers > 0
+end
+
+function MOD:IsPreviewActive()
+    return self.PreviewUntil and GetTime() < self.PreviewUntil
+end
+
+function MOD:GetPreviewColor()
+    local previewColor = self:GetSingleTankColor()
+    if previewColor then
+        return previewColor
+    end
+
+    if UnitExists('player') then
+        return self:GetConfiguredTankColor('player')
+    end
+
+    return { r = 1, g = 0.82, b = 0.2 }
+end
+
+function MOD:StopPreview(forceRefresh)
+    self.PreviewUntil = nil
+    if self.PreviewFrame then
+        self.PreviewFrame:SetScript('OnUpdate', nil)
+    end
+
+    if forceRefresh then
+        self:ForceUpdatePlates()
+    end
+end
+
+function MOD:StartPreview(duration)
+    duration = duration or 5
+    self.PreviewUntil = GetTime() + duration
+
+    if not self.PreviewFrame then
+        self.PreviewFrame = CreateFrame('Frame')
+    end
+
+    self.PreviewFrame:SetScript('OnUpdate', function()
+        if not MOD:IsPreviewActive() then
+            MOD:StopPreview(true)
+        end
+    end)
+
+    self:ForceUpdatePlates()
+end
+
+function MOD:ApplyPreset(preset)
+    if preset == 'subtle' then
+        self.db.borderSize = 2
+        self.db.borderAlpha = 0.7
+        self.db.overlayEnabled = true
+        self.db.overlayAlpha = 0.08
+    elseif preset == 'strong' then
+        self.db.borderSize = 4
+        self.db.borderAlpha = 1
+        self.db.overlayEnabled = true
+        self.db.overlayAlpha = 0.25
+    elseif preset == 'border' then
+        self.db.borderSize = 3
+        self.db.borderAlpha = 1
+        self.db.overlayEnabled = false
+        self.db.overlayAlpha = 0
+    elseif preset == 'overlay' then
+        self.db.borderSize = 1
+        self.db.borderAlpha = 0.25
+        self.db.overlayEnabled = true
+        self.db.overlayAlpha = 0.32
+    end
+
+    self:ClearAllCachedColors()
+    self:ForceUpdatePlates()
 end
 
 function MOD:ClearAllCachedColors()
@@ -154,7 +312,7 @@ end
 function MOD:GetTankSourceColor(unit, unitName)
     if self.db.autoMainTanks and GetPartyAssignment and GetPartyAssignment('MAINTANK', unit) then
         self:DebugPrint(('MAINTANK match: %s (%s)'):format(unitName or 'unknown', unit or 'nil'))
-        return GetClassColor(unit), unitName, 'maintank'
+        return self:GetConfiguredTankColor(unit, unitName), unitName, 'maintank'
     end
 
     return nil
@@ -215,14 +373,14 @@ end
 function MOD:ForEachConfiguredTankUnit(func)
     if not func then return end
 	local seen = {}
+	local tanks = {}
 
     if UnitExists('player') then
         local playerName = UnitName('player')
-        local color, configuredName, source = self:GetTankSourceColor('player', playerName)
 		local key = GetUnitKey(playerName)
-        if color and key and not seen[key] then
+		if key and not seen[key] and self.db.autoMainTanks and GetPartyAssignment and GetPartyAssignment('MAINTANK', 'player') then
 			seen[key] = true
-            func('player', playerName, color, configuredName, source)
+            tinsert(tanks, { unit = 'player', unitName = playerName, key = key, configuredName = playerName, source = 'maintank' })
         end
     end
 
@@ -230,11 +388,10 @@ function MOD:ForEachConfiguredTankUnit(func)
         local unit = 'party' .. i
         if UnitExists(unit) then
             local unitName = UnitName(unit)
-            local color, configuredName, source = self:GetTankSourceColor(unit, unitName)
 			local key = GetUnitKey(unitName)
-            if color and key and not seen[key] then
+			if key and not seen[key] and self.db.autoMainTanks and GetPartyAssignment and GetPartyAssignment('MAINTANK', unit) then
 				seen[key] = true
-                func(unit, unitName, color, configuredName, source)
+                tinsert(tanks, { unit = unit, unitName = unitName, key = key, configuredName = unitName, source = 'maintank' })
             end
         end
     end
@@ -243,14 +400,22 @@ function MOD:ForEachConfiguredTankUnit(func)
         local unit = 'raid' .. i
         if UnitExists(unit) then
             local unitName = UnitName(unit)
-            local color, configuredName, source = self:GetTankSourceColor(unit, unitName)
 			local key = GetUnitKey(unitName)
-            if color and key and not seen[key] then
+			if key and not seen[key] and self.db.autoMainTanks and GetPartyAssignment and GetPartyAssignment('MAINTANK', unit) then
 				seen[key] = true
-                func(unit, unitName, color, configuredName, source)
+                tinsert(tanks, { unit = unit, unitName = unitName, key = key, configuredName = unitName, source = 'maintank' })
             end
         end
     end
+
+	if self.db and self.db.useCustomColor then
+		self:RefreshCustomColorAssignments(tanks)
+	end
+
+	for i = 1, #tanks do
+		local tank = tanks[i]
+		func(tank.unit, tank.unitName, self:GetConfiguredTankColor(tank.unit, tank.unitName), tank.configuredName, tank.source)
+	end
 end
 
 function MOD:ResolveThreatMobUnit(nameplate, unit)
@@ -409,6 +574,15 @@ function MOD:GetDesiredPlateColor(nameplate, unit)
         return nil
     end
 
+	if self:IsPreviewActive() then
+		return self:GetPreviewColor()
+	end
+
+	if self.db.onlyInGroup and not self:IsGroupContextActive() then
+		self:ClearCachedColor(nameplate, unit)
+		return nil
+	end
+
     local color, tankName, status, _, mobUnit, source = self:GetTankThreatColor(nameplate, unit)
     if color and color.r and color.g and color.b then
         self:SetCachedColor(nameplate, unit, color, tankName, status, mobUnit, source)
@@ -488,6 +662,7 @@ function MOD:PrintHelp()
     E:Print('  /etp refresh')
     E:Print('  /etp enable | disable')
     E:Print('  /etp automt               (toggle auto raid Main Tanks)')
+    E:Print('  /etp preview              (show current style for 5 seconds)')
     E:Print('  /etp debug                (toggle debug output)')
 end
 
@@ -521,6 +696,10 @@ function MOD:HandleSlash(msg)
         self.db.debug = not self.db.debug
         E:Print(('ElvUIThreatPlates: debug %s'):format(self.db.debug and 'enabled' or 'disabled'))
         return
+    elseif cmd == 'preview' or cmd == 'test' then
+		self:StartPreview(5)
+		E:Print('ElvUIThreatPlates: preview started for 5 seconds')
+		return
     elseif cmd == 'refresh' then
         self:ClearAllCachedColors()
         self:ForceUpdatePlates()
@@ -597,6 +776,18 @@ function MOD:InsertOptions()
 							self:ForceUpdatePlates()
 						end,
 					},
+                    onlyInGroup = {
+                        order = 4,
+                        type = 'toggle',
+                        name = 'Only In Group/Raid',
+                        desc = 'Only show threat markers while you are in a party or raid.',
+                        width = 'full',
+                        set = function(info, value)
+                            self.db[info[#info]] = value
+                            self:ClearAllCachedColors()
+                            self:ForceUpdatePlates()
+                        end,
+                    },
                 },
             },
 
@@ -659,7 +850,7 @@ function MOD:InsertOptions()
                         name = 'Overlay Opacity',
                         desc = 'Controls how strong the health bar overlay appears.',
                         min = 0,
-                        max = 0.5,
+                        max = 1,
                         step = 0.01,
                         isPercent = true,
                         width = 0.9,
@@ -667,6 +858,106 @@ function MOD:InsertOptions()
                         set = function(info, value)
                             self.db[info[#info]] = value
                             self:ForceUpdatePlates()
+                        end,
+                    },
+                    useCustomColor = {
+                        order = 6,
+                        type = 'toggle',
+                        name = 'Use Custom Colors',
+                        desc = 'Use one custom color for tank 1 and another for tank 2 instead of class colors.',
+                        width = 'full',
+                        set = function(info, value)
+                            self.db[info[#info]] = value
+                            self:ClearAllCachedColors()
+                            self:ForceUpdatePlates()
+                        end,
+                    },
+                    customColorInfo = {
+                        order = 7,
+                        type = 'description',
+                        name = 'Custom colors are assigned to the first and second detected Main Tanks.',
+                        fontSize = 'medium',
+                        width = 'full',
+                        hidden = function() return not self.db.useCustomColor end,
+                    },
+                    customColorOne = {
+                        order = 8,
+                        type = 'color',
+                        name = 'Tank 1 Color',
+                        desc = 'Custom color used for the first detected Main Tank.',
+                        width = 'half',
+                        disabled = function() return not self.db.useCustomColor end,
+                        get = function()
+                            local colors = self.db.customColors or DEFAULTS.customColors
+                            local color = colors[1] or DEFAULTS.customColors[1]
+                            return color.r, color.g, color.b
+                        end,
+                        set = function(_, r, g, b)
+                            self.db.customColors = self.db.customColors or {}
+                            self.db.customColors[1] = self.db.customColors[1] or {}
+                            self.db.customColors[1].r = r
+                            self.db.customColors[1].g = g
+                            self.db.customColors[1].b = b
+                            self:ClearAllCachedColors()
+                            self:ForceUpdatePlates()
+                        end,
+                    },
+                    customColorTwo = {
+                        order = 9,
+                        type = 'color',
+                        name = 'Tank 2 Color',
+                        desc = 'Custom color used for the second detected Main Tank.',
+                        width = 'half',
+                        disabled = function() return not self.db.useCustomColor end,
+                        get = function()
+                            local colors = self.db.customColors or DEFAULTS.customColors
+                            local color = colors[2] or DEFAULTS.customColors[2]
+                            return color.r, color.g, color.b
+                        end,
+                        set = function(_, r, g, b)
+                            self.db.customColors = self.db.customColors or {}
+                            self.db.customColors[2] = self.db.customColors[2] or {}
+                            self.db.customColors[2].r = r
+                            self.db.customColors[2].g = g
+                            self.db.customColors[2].b = b
+                            self:ClearAllCachedColors()
+                            self:ForceUpdatePlates()
+                        end,
+                    },
+                    presetSubtle = {
+                        order = 10,
+                        type = 'execute',
+                        name = 'Subtle',
+                        width = 0.7,
+                        func = function()
+                            self:ApplyPreset('subtle')
+                        end,
+                    },
+                    presetStrong = {
+                        order = 11,
+                        type = 'execute',
+                        name = 'Strong',
+                        width = 0.7,
+                        func = function()
+                            self:ApplyPreset('strong')
+                        end,
+                    },
+                    presetBorderOnly = {
+                        order = 12,
+                        type = 'execute',
+                        name = 'Border Only',
+                        width = 0.9,
+                        func = function()
+                            self:ApplyPreset('border')
+                        end,
+                    },
+                    presetOverlayOnly = {
+                        order = 13,
+                        type = 'execute',
+                        name = 'Overlay Only',
+                        width = 0.9,
+                        func = function()
+                            self:ApplyPreset('overlay')
                         end,
                     },
                 },
@@ -703,10 +994,20 @@ function MOD:InsertOptions()
                             self:ForceUpdatePlates()
                         end,
                     },
-                    info = {
+                    preview = {
                         order = 4,
+                        type = 'execute',
+                        name = 'Preview/Test',
+                        desc = 'Temporarily show the current style on visible enemy plates.',
+                        width = 'full',
+                        func = function()
+                            self:StartPreview(5)
+                        end,
+                    },
+                    info = {
+                        order = 5,
                         type = 'description',
-                        name = 'Use Refresh Plates if you want to force all visible nameplates to redraw immediately after changing settings.',
+                        name = 'Use Preview/Test to check the style instantly, or Refresh Plates if you want to force all visible nameplates to redraw immediately after changing settings.',
                         fontSize = 'medium',
                         width = 'full',
                     },
